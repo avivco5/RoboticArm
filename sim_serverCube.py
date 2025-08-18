@@ -13,9 +13,9 @@ import numpy as np
 from typing import Optional
 from omni.isaac.core import World
 from omni.isaac.core.articulations import Articulation
-from omni.isaac.core.utils import stage as stage_utils
 from omni.isaac.core.objects import DynamicCuboid, GroundPlane
-from pxr import Usd, UsdPhysics
+from omni.isaac.core.utils import stage as stage_utils
+from pxr import Usd, UsdPhysics, PhysxSchema
 import omni.usd as ou
 
 # -------- EDIT THESE --------
@@ -32,16 +32,29 @@ def find_articulation(stage: Usd.Stage) -> Optional[str]:
     return None
 
 def main():
+    print("[INFO] Loading stage...")
     stage_utils.open_stage(USD_PATH)
     stage = ou.get_context().get_stage()
-    # --- Add Ground Plane ---
-    GroundPlane(prim_path="/World/GroundPlane", name="ground", size=10.0)
-
     if stage is None:
         print(f"[ERROR] Failed to open stage: {USD_PATH}")
         input("Press Enter to exit...")
         return
 
+    # --- Add Ground Plane ---
+    GroundPlane(prim_path="/World/GroundPlane", name="ground", size=10.0)
+    print("[OK] Ground plane added")
+
+    # --- Add Target Cube ---
+    target = DynamicCuboid(
+        prim_path="/World/TargetCube",
+        name="target_cube",
+        position=np.array([0.5, 0.0, 0.3]),  # X,Y,Z in meters
+        size=0.1,
+        color=np.array([1.0, 0.0, 0.0])      # אדום
+    )
+    print("[OK] Target cube added at /World/TargetCube")
+
+    # --- Find robot articulation ---
     robot_prim = ROBOT_PATH or find_articulation(stage)
     if not robot_prim:
         print("[ERROR] No articulation root found!")
@@ -57,6 +70,7 @@ def main():
 
     dof_names = robot.dof_names
     n = robot.num_dof
+    print(f"[OK] Robot has {n} DOFs: {dof_names}")
 
     # Limits
     try:
@@ -74,6 +88,20 @@ def main():
     # Target buffer
     q_target = np.array(robot.get_joint_positions(), dtype=float)
     q_target = np.clip(q_target, lo, hi)
+
+    # ---- Drive API setup ----
+    drive_apis = []
+    for jn in dof_names:
+        jp = f"{robot_prim}/{jn}"
+        joint_prim = stage.GetPrimAtPath(jp)
+        if not joint_prim.IsValid():
+            continue
+        drive_api = PhysxSchema.PhysxJointDriveAPI.Apply(joint_prim, "drive")
+        drive_api.CreateStiffnessAttr().Set(400.0)    # KP
+        drive_api.CreateDampingAttr().Set(5.0)        # KD
+        drive_api.CreateMaxForceAttr().Set(20.0)      # Torque limit
+        drive_apis.append((jn, drive_api))
+    print(f"[OK] Drive API initialized for {len(drive_apis)} joints")
 
     # ---- TCP server ----
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -164,14 +192,15 @@ def main():
                         client = None
                         client_buf = b""
 
-            # ---- Cyclic motion ----
+            # ---- Motion (example wave) ----
             t = time.time() - start_time
-            wave = 0.3 * np.sin(1.0 * t)   # amplitude 0.3 rad, frequency ~0.16Hz
+            wave = 0.3 * np.sin(1.0 * t)   # amplitude 0.3 rad
             q_target = np.clip(wave * np.ones(n), lo, hi)
 
-            # Apply to sim
+            # ---- Apply target as Drive ----
             q_cmd = np.clip(q_target, lo, hi)
-            robot.set_joint_positions(q_cmd.tolist())
+            for (jn, drive_api), val in zip(drive_apis, q_cmd.tolist()):
+                drive_api.GetTargetPositionAttr().Set(val)
 
             # ---- Telemetry ----
             now = time.time()
@@ -182,13 +211,18 @@ def main():
 
             world.step(render=True)
 
+    except Exception as e:
+        print("[FATAL] Exception in main loop:", e)
+        input("Press Enter to exit...")
+
     finally:
+        print("[CLEANUP] stopping world...")
         world.stop()
-        simulation_app.close()
         try:
             if client: client.close()
             srv.close()
         except: pass
+        # לא סוגרים את simulation_app כדי שהחלון יישאר פתוח!
 
 if __name__ == "__main__":
     main()

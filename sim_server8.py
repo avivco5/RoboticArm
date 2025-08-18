@@ -8,23 +8,23 @@ except ImportError:
 
 simulation_app = SimulationApp({"headless": False})
 
-import time, numpy as np
+import json, socket, time
+import numpy as np
 from typing import Optional
 from omni.isaac.core import World
 from omni.isaac.core.articulations import Articulation
 from omni.isaac.core.objects import DynamicCuboid, GroundPlane
 from omni.isaac.core.utils import stage as stage_utils
+from pxr import Usd, UsdPhysics, PhysxSchema
 import omni.usd as ou
-from pxr import Usd, UsdPhysics
 
 # -------- EDIT THESE --------
 USD_PATH   = r"C:\IsaacSim\PyCode\rvUSD.usd"
 ROBOT_PATH = None
-END_EFFECTOR = "Link_6"   # נעדכן אחרי שנראה פלט מ-get_links
+HOST, PORT = "0.0.0.0", 6000
 # ----------------------------
 
 def find_articulation(stage: Usd.Stage) -> Optional[str]:
-    """חיפוש articulation root הראשון ב-Stage"""
     for prim in stage.Traverse():
         if prim.IsValid() and UsdPhysics.ArticulationRootAPI(prim):
             return prim.GetPath().pathString
@@ -47,7 +47,7 @@ def main():
         prim_path="/World/TargetCube",
         name="target_cube",
         position=np.array([0.1, 0.1, 0.3]),
-        size=0.05,
+        size=0.1,
         color=np.array([1.0, 0.0, 0.0])
     )
     print("[OK] Target cube added at /World/TargetCube")
@@ -63,49 +63,45 @@ def main():
     # World + robot
     world = World(stage_units_in_meters=1.0)
     world.scene.add(Articulation(prim_path=robot_prim, name="my_robot"))
-    world.reset()
-    world.play()
-
+    world.reset(); world.play()
     robot = world.scene.get_object("my_robot")
 
-    # Debug info
     dof_names = robot.dof_names
     print(f"[OK] Robot has {robot.num_dof} DOFs: {dof_names}")
 
-    # 🔍 כאן נדפיס את הלינקים בפועל
-    try:
-        links = robot.get_links()
-        print("[LINKS] Names of links:")
-        for l in links:
-            print("   ", l.name)
-    except Exception as e:
-        print("[WARN] Could not get links:", e)
+    # ---- Drive API setup ----
+    drive_apis = []
+    for jn in dof_names:
+        jp = f"{robot_prim}/{jn}"
+        joint_prim = stage.GetPrimAtPath(jp)
+        if not joint_prim.IsValid():
+            continue
+        drive_api = PhysxSchema.PhysxJointDriveAPI.Apply(joint_prim, "drive")
+        drive_api.CreateStiffnessAttr().Set(400.0)    # KP
+        drive_api.CreateDampingAttr().Set(5.0)        # KD
+        drive_api.CreateMaxForceAttr().Set(50.0)      # Torque limit
+        drive_apis.append((jn, drive_api))
+    print(f"[OK] Drive API initialized for {len(drive_apis)} joints")
 
     # ----------------- MAIN LOOP -----------------
-    t = 0.0
     try:
         while simulation_app.is_running():
             world.step(render=True)
 
-            # ---- Move cube in sinusoidal path ----
-            x = 0.1+ 0.1*np.sin(t)
-            z = 0.1 + 0.05*np.cos(0.5*t)
-            cube_pos = np.array([x, 0.0, z])
-            target.set_world_pose(position=cube_pos)
+            # ---- Get cube target position ----
+            cube_pos, _ = target.get_world_pose()
 
             # ---- Compute IK to follow cube ----
             try:
                 ik_result = robot.compute_inverse_kinematics(
                     target_position=cube_pos,
-                    end_effector_link_name=END_EFFECTOR
+                    end_effector_name="gripper"  # <--- שנה לשם האמיתי!
                 )
                 if ik_result is not None:
-                    robot.set_joint_positions(ik_result)
+                    for (jn, drive_api), val in zip(drive_apis, ik_result.tolist()):
+                        drive_api.GetTargetPositionAttr().Set(float(val))
             except Exception as e:
-                print("[IK ERROR]", e)
-
-            t += 0.02
-            time.sleep(0.02)
+                pass  # אם אין end_effector מוגדר זה פשוט יתעלם
 
     except Exception as e:
         print("[FATAL]", e)
